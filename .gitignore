@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+downloads/
+.gofast_v5_*/
+*.partial
+*.part
+*.old
+*.log
