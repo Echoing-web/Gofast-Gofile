@@ -1,84 +1,68 @@
-# GoFast-GoFile v5.1
+# GoFast-GoFile v5.3
 
-GoFast-GoFile 是一个面向 Windows 的 GoFile 大文件下载工具。它支持多连接 `Range` 下载、断点续传、自动并发测速、v1/v2 到 v5 的状态迁移，以及短 `.partial` 文件修复。
+针对 v5.1 "并行下载请求过多触发服务器熔断" 问题的架构演进版（v5.2 准入控制架构 + v5.3 提速/瘦身/资源防线迭代）。
+核心不变量：**所有对外请求必经全局准入控制器**（熔断器 + 令牌桶 + AIMD 自适应并发）；
+v5.3 新增**尾段动态分裂**（饥饿 worker 自动再切分大分片，尾段不再掉速）、
+**Retry-After 感知冷却**（服务器说等 2 秒就等 2 秒，不再盲目指数升级）、
+**分段缓冲写**（每分片一次文件打开 + 4MiB 大块），以及 exe 瘦身（较 v5.1 小 17.7%）。
 
-## 功能概览
+## 与 v5.1 的关系
 
-- **多连接下载**：在服务器支持 HTTP `206 Partial Content` 时，将文件切分为多个分片并发写入同一个临时文件。
-- **断点续传**：下载状态保存在目标目录下的 `.gofast_v5_<文件名>` 中，再次执行相同命令即可继续。
-- **自动并发测速**：使用少量 `Range` 探测请求，从预设并发数中选择测速结果较好的值；探测不会写入目标文件。
-- **单连接回退**：服务器不支持分片下载时，自动使用单连接断点续传。
-- **旧版迁移**：读取 v1/v2 的 `manifest.json` 和 `.part` 文件，生成 v5 状态；旧版目录保持不变。
-- **状态修复**：将过短的 v5 `.partial` 文件扩展到清单记录的大小，已有字节不会被删除；过大的文件会被拒绝处理。
+- CLI 子命令与参数**完全兼容**：`download / migrate-v2 / repair-v5` 照旧，v5.1 清单（含崩溃态 DOWN/RETRY/FAIL）可直接续传。
+- Recovery 补丁合并为内置 `recover` 子命令（可信前缀算法，修复 v5.1 补丁的 NUL 字面量数据洞 bug）。
+- guest token 持久化复用（防 IP 封禁），支持 `--token` premium 直用，被拒自动重建。
 
 ## 快速开始
 
-### 1. 准备环境
-
-- Windows 10 或更高版本。
-- Python 3.10 或更高版本，并确保 `py` 命令可用。
-- 网络可以访问 `gofile.io` 及其 API。
-- 下载链接应为 `https://gofile.io/d/<内容编号>` 格式。
-
-### 2. 安装依赖并构建程序
-
-在仓库目录打开 PowerShell，执行：
-
 ```powershell
 py -m pip install -r requirements.txt
-.\build_exe.bat
+
+# 基本下载（默认 AIMD 自适应并发，上限 16）
+py -m gofast52 download "https://gofile.io/d/XXXXXX" --out "D:\Download"
+
+# v5.1 参数照常 + v5.2/v5.3 新增
+py -m gofast52 download "https://gofile.io/d/XXXXXX" --workers 32 --verbose
+#   --req-rate 4        新请求发起速率上限（令牌桶）
+#   --max-open-min 15   熔断累计冷却放弃阈值（无人值守安全）
+#   --no-adaptive       固定并发，关 AIMD
+#   --token XXX         使用自己的（premium）token
+#   --verbose           关键准入/链接事件
 ```
 
-构建完成后，可执行文件位于 `dist\GoFast-GoFile-v5.1.exe`。`build_exe.bat` 会安装或更新 `PyInstaller` 和 `requests`。
-
-### 3. 下载文件
-
-直接使用 Python：
+### 恢复 / 迁移
 
 ```powershell
-py .\gofast.py download "https://gofile.io/d/内容编号" --out "D:\Downloads"
+py -m gofast52 recover --state-dir "D:\x\.gofast_v5_文件名" [--strict]
+py -m gofast52 migrate-v2 --v2-dir "D:\旧目录"
+py -m gofast52 repair-v5 --v5-dir "D:\x\.gofast_v5_文件名"
 ```
 
-使用构建后的程序：
+## 构建单文件 exe
 
 ```powershell
-.\dist\GoFast-GoFile-v5.1.exe download "https://gofile.io/d/内容编号" --workers 32 --out "D:\Downloads"
+py -m pip install pyinstaller
+build_exe_v53.bat
+# 产物: dist\GoFast-GoFile-v5.3.exe  (约 8.3 MiB，较 v5.1 小 17.7%)
 ```
 
-下载中断后，重新执行同一条命令即可继续。默认输出目录是当前目录下的 `downloads`。多连接模式完成时，如果目标位置已有同名文件，旧文件会先改名为 `.old`。
+## 测试（发布四门 + 交叉验证）
 
-## 常用操作
-
-完整的功能说明、参数表、迁移步骤、修复步骤和排错方法见 [`docs/功能与操作指引.md`](docs/功能与操作指引.md)。
-
-常用 Windows 脚本：
-
-- `download_auto.bat`：输入链接后自动测速并选择并发数。
-- `download_64.bat`：输入链接后使用最多 64 个并发连接。
-- `handoff_v2_to_v5.bat`：将已停止的 v1/v2 下载状态迁移到 v5。
-- `repair_v5.bat`：修复过短的 v5 `.partial` 文件。
-
-## 安全与数据边界
-
-- 迁移前必须先关闭旧版 GoFast 下载进程；工具只会拒绝迁移，不会替用户结束进程。
-- v1/v2 的原目录、`manifest.json` 和 `.part` 文件不会被本工具删除或修改。
-- 修复操作只会扩展过短的 `.partial`；文件过大或清单不匹配时会停止。
-- 程序会向 GoFile 创建临时 API 账号以读取内容信息，不会把账号令牌写入项目文件或日志。
-- 请不要把下载链接中的密码、个人路径、运行日志或生成的 `dist` 文件提交到公开仓库。
-
-## 项目结构
-
-```text
-gofast.py                 主程序
-requirements.txt          Python 依赖
-build_exe.bat             构建 Windows 可执行文件
-download_auto.bat         自动并发下载入口
-download_64.bat           64 并发下载入口
-handoff_v2_to_v5.bat      v1/v2 状态迁移入口
-repair_v5.bat             v5 状态修复入口
-docs/                     功能与操作文档
+```powershell
+py -m pip install -r requirements-dev.txt
+py -m pytest tests -q     # 288 项：单元 + BDD + 压力 + 内存泄漏 + 冒烟 + 双路交叉验证
 ```
 
-## 许可说明
+- 单元/TDD：`tests/test_*.py`（核心控制、引擎、IO 兼容）
+- BDD：`tests/bdd/features/`（熔断恢复、自适应并发、生命周期、恢复扫描、安全、兼容、v5.3 提速）
+- 压力组：`tests/test_stress.py`（24MiB×16workers、节流风暴、重复运行）
+- 内存泄漏组：`tests/test_memory.py`（线程基线/取消唤醒/堆增长/gc/响应关闭）
+- 冒烟组：`tests/test_smoke.py`（子进程级子命令端到端）
+- 交叉验证：`tests/test_crosscheck.py`（多连接 vs 单连接同数据一致、崩溃→recover→续传闭环等 5 项双路对照）
 
-本仓库当前未附带许可证文件。若要公开发布、二次分发或合并第三方代码，请先补充明确的许可证和来源说明。
+目录：`gofast52/`（包）· `tests/` · `docs/`（SPEC 规格书、DESIGN 评审与迭代记录、REPORT 验收报告）。
+
+## 安全边界
+
+- 仅 http/https；直链与每一跳重定向经 URLGuard 校验，拒绝环回/私有/保留/映射 v6/localhost 类地址。
+- 所有本地写入限定在状态目录内（realpath+commonpath+原子替换），收尾先 fsync 再改名。
+- token 仅存本地 `~/.gofast52/`。

@@ -12,3 +12,9 @@ downloads/
 *.part
 *.old
 *.log
+__pycache__/  
+*.pyc  
+.pytest_cache/  
+.coverage  
+dist/  
+build/  
