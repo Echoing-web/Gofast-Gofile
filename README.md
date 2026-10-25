@@ -1,68 +1,103 @@
-# GoFast-GoFile v5.3
+# GoFast-GoFile
 
-针对 v5.1 "并行下载请求过多触发服务器熔断" 问题的架构演进版（v5.2 准入控制架构 + v5.3 提速/瘦身/资源防线迭代）。
-核心不变量：**所有对外请求必经全局准入控制器**（熔断器 + 令牌桶 + AIMD 自适应并发）；
-v5.3 新增**尾段动态分裂**（饥饿 worker 自动再切分大分片，尾段不再掉速）、
-**Retry-After 感知冷却**（服务器说等 2 秒就等 2 秒，不再盲目指数升级）、
-**分段缓冲写**（每分片一次文件打开 + 4MiB 大块），以及 exe 瘦身（较 v5.1 小 17.7%）。
+**面向 GoFile 网盘的高速多线程下载器——在不触发服务器熔断的前提下跑满带宽。**
 
-## 与 v5.1 的关系
+从 `gofile.io` 拉取大文件（游戏客户端、压缩包、数据集……）时，普通多线程下载器最容易遇到的不是速度不够，而是**并行请求一多就被服务器限流甚至封 IP**，之后越重试死得越快。GoFast-GoFile 为此而生：它把"对服务器友好"做进了架构里，同时保留断点续传、崩溃恢复等大文件下载的全部刚需能力。
 
-- CLI 子命令与参数**完全兼容**：`download / migrate-v2 / repair-v5` 照旧，v5.1 清单（含崩溃态 DOWN/RETRY/FAIL）可直接续传。
-- Recovery 补丁合并为内置 `recover` 子命令（可信前缀算法，修复 v5.1 补丁的 NUL 字面量数据洞 bug）。
-- guest token 持久化复用（防 IP 封禁），支持 `--token` premium 直用，被拒自动重建。
+---
+
+## 它解决什么问题
+
+| 你遇到的麻烦 | GoFast-GoFile 的做法 |
+|--------------|----------------------|
+| 下载器并发一高就被 GoFile 熔断（429/限流/封 IP） | 所有请求必经**全局准入闸门**：熔断器 + 令牌桶 + AIMD 自适应并发——并发从 4 起步按服务器反馈伸缩，被限流立刻整体退避，冷却期内零新请求 |
+| 被限流后下载器"重试风暴"，越试越死 | 收到限流信号即打开熔断器；退避带随机抖动；服务器给的 `Retry-After` 被精确执行（说等 2 秒就等 2 秒，不盲目放大） |
+| 几十 GB 下到一半断网/重启，前功尽弃 | **字节级断点续传**：崩溃现场自动保存（含各种中断状态），重跑同一条命令即从断点继续，已完成字节绝不重下 |
+| 状态文件损坏/清单丢失，partial 成了废数据 | 内置 `recover` 扫描：按"可信前缀"算法从 partial 重建进度清单——只信已验证数据，宁可贵绝不产出带洞文件 |
+| 下载直链中途过期（403） | 自动经 API 刷新直链并原分片续传，无需人工重开 |
+| 频繁新建 guest 账号被 GoFile 封 IP | guest token 本地持久化复用，失效自动重建一次；也可 `--token` 直接用你自己的 premium 账号（更高配额） |
+| 挂机过夜，早上发现卡死在无限重试 | 熔断累计冷却超 15 分钟自动保存现场并干净退出，不浪费流量也不假死 |
+
+## 主要功能
+
+- **多线程 Range 分片下载**，64MiB 分片 + 尾段动态分裂（收尾阶段不再掉速）
+- **AIMD 自适应并发**：健康时缓慢爬升、限流立即减半，自动收敛到服务器容忍度
+- **熔断与自愈**：连续限流→熔断冷却（尊重 Retry-After）→单试探恢复→逐步放开
+- **完整的状态机**：断点续传 / 恢复扫描 / v1、v2 老版本状态迁移 / 短 partial 修复，四个恢复类子命令各司其职
+- **进度 UI**：速度、ETA、分片状态、当前并发上限与熔断器状态一目了然
+- **单文件绿色 exe**（约 8.3 MiB），免安装；也可直接用 Python 运行
+
+## 适用场景
+
+- 从 GoFile 下载**大体积文件**且网络不稳定、需要挂机过夜
+- 曾被 GoFile **限流/封 IP**、想要一个"会看服务器脸色"的下载器
+- **老版本 GoFast（v1/v2/v5.1）用户**：命令行参数与状态文件完全兼容，一条命令无缝迁移续传
+- 需要在脚本/计划任务里**无人值守**跑批量下载（有明确的放弃阈值与现场保存）
 
 ## 快速开始
 
 ```powershell
-py -m pip install -r requirements.txt
-
-# 基本下载（默认 AIMD 自适应并发，上限 16）
-py -m gofast52 download "https://gofile.io/d/XXXXXX" --out "D:\Download"
-
-# v5.1 参数照常 + v5.2/v5.3 新增
-py -m gofast52 download "https://gofile.io/d/XXXXXX" --workers 32 --verbose
-#   --req-rate 4        新请求发起速率上限（令牌桶）
-#   --max-open-min 15   熔断累计冷却放弃阈值（无人值守安全）
-#   --no-adaptive       固定并发，关 AIMD
-#   --token XXX         使用自己的（premium）token
-#   --verbose           关键准入/链接事件
-```
-
-### 恢复 / 迁移
-
-```powershell
-py -m gofast52 recover --state-dir "D:\x\.gofast_v5_文件名" [--strict]
-py -m gofast52 migrate-v2 --v2-dir "D:\旧目录"
-py -m gofast52 repair-v5 --v5-dir "D:\x\.gofast_v5_文件名"
-```
-
-## 构建单文件 exe
-
-```powershell
-py -m pip install pyinstaller
+# 方式一：exe（推荐普通用户）
+#  从 Releases 下载 GoFast-GoFile-v5.3.exe，或自行构建：
+py -m pip install -r requirements.txt pyinstaller
 build_exe_v53.bat
-# 产物: dist\GoFast-GoFile-v5.3.exe  (约 8.3 MiB，较 v5.1 小 17.7%)
+.\dist\GoFast-GoFile-v5.3.exe download "https://gofile.io/d/XXXXXX" --out "D:\Download"
+
+# 方式二：Python 直接运行
+py -m pip install -r requirements.txt
+py -m gofast52 download "https://gofile.io/d/XXXXXX" --out "D:\Download"
 ```
 
-## 测试（发布四门 + 交叉验证）
+下载中断（断网/Ctrl+C/关机）后，**重跑同一条命令**即从断点继续。
+
+## 命令与参数一览
+
+| 命令 | 用途 |
+|------|------|
+| `download <url>` | 下载 / 续传（多文件内容会列出让你选） |
+| `recover --state-dir <目录>` | 清单损坏/丢失时，扫描 partial 重建进度（`--strict` 逐字节全扫） |
+| `repair-v5 --v5-dir <目录>` | 把过短的 partial 扩展到目标大小（绝不删已有数据） |
+| `migrate-v2 --v2-dir <目录>` | 把 v1/v2 老版本已下载分片迁入 v5 续传（原目录只读不动） |
+
+`download` 常用参数（与 v5.1 完全兼容）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--workers` | 16 | 并发上限（AIMD 在此之内自适应；保守起步可给 8） |
+| `--segment-mib` | 64 | 分片大小（≥8） |
+| `--retries` | 8 | 单分片技术性重试预算（限流不消耗它） |
+| `--req-rate` | 4 | 新请求发起速率上限（令牌桶，防突发） |
+| `--max-open-min` | 15 | 熔断累计冷却超过该分钟数则保存现场放弃 |
+| `--no-adaptive` | — | 关闭 AIMD，固定并发 |
+| `--token` | — | 使用自己的（premium）账号 token |
+| `--password` / `--auto-workers` / `--verbose` | | 内容密码 / v5.1 兼容旗标 / 关键事件输出 |
+
+## 工作原理（一分钟版）
+
+```
+                       ┌──────────── 准入闸门（每个请求必经）────────────┐
+ 分片调度器 ──领取分片──▶│ 熔断器(429/503→冷却,尊重Retry-After,双试探恢复) │──▶ GoFile
+ （动态分裂尾段）        │ 令牌桶(新请求≤N/s) → AIMD并发闸(4↗16,限流即减半) │    CDN
+                       └────────────────────────────────────────────────┘
+ 落盘：每分片一次定位写 + 原子清单 + 收尾 fsync→改名   恢复：断点/recover/迁移/修复
+```
+
+设计规格、评审记录与测试档案见 [`docs/`](docs/)（SPEC / DESIGN / REPORT）；各版本更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 测试与质量
 
 ```powershell
 py -m pip install -r requirements-dev.txt
-py -m pytest tests -q     # 288 项：单元 + BDD + 压力 + 内存泄漏 + 冒烟 + 双路交叉验证
+py -m pytest tests -q    # 288 项：单元+BDD+压力+内存泄漏+冒烟+双路交叉验证，全离线可跑
 ```
 
-- 单元/TDD：`tests/test_*.py`（核心控制、引擎、IO 兼容）
-- BDD：`tests/bdd/features/`（熔断恢复、自适应并发、生命周期、恢复扫描、安全、兼容、v5.3 提速）
-- 压力组：`tests/test_stress.py`（24MiB×16workers、节流风暴、重复运行）
-- 内存泄漏组：`tests/test_memory.py`（线程基线/取消唤醒/堆增长/gc/响应关闭）
-- 冒烟组：`tests/test_smoke.py`（子进程级子命令端到端）
-- 交叉验证：`tests/test_crosscheck.py`（多连接 vs 单连接同数据一致、崩溃→recover→续传闭环等 5 项双路对照）
+## 安全与使用须知
 
-目录：`gofast52/`（包）· `tests/` · `docs/`（SPEC 规格书、DESIGN 评审与迭代记录、REPORT 验收报告）。
+- 仅发起 http/https 请求；直链与每一跳重定向都经 SSRF 校验（拒绝环回/私有/保留地址）。
+- 本地状态全部原子写入并限定在状态目录内；收尾先 fsync 再改名，断电不产出半截文件。
+- 账号 token 仅保存在本机 `~/.gofast52/`，不上传。
+- 请遵守 GoFile 服务条款，仅下载你有权获取的内容；本工具不提供任何绕过付费/版权限制的能力。
 
-## 安全边界
+## 许可
 
-- 仅 http/https；直链与每一跳重定向经 URLGuard 校验，拒绝环回/私有/保留/映射 v6/localhost 类地址。
-- 所有本地写入限定在状态目录内（realpath+commonpath+原子替换），收尾先 fsync 再改名。
-- token 仅存本地 `~/.gofast52/`。
+暂未附许可证文件（沿用仓库现状）；公开发布前请补充。
