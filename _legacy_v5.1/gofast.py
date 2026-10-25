@@ -78,7 +78,7 @@ def create_account(s: requests.Session, salt: str) -> str:
     r.raise_for_status()
     j = r.json()
     if j.get("status") != "ok":
-        raise RuntimeError(f"GoFile 账号创建失败: {j}")
+        raise RuntimeError(f"GoFile account creation failed: {j}")
     return j["data"]["token"]
 
 
@@ -98,7 +98,7 @@ def get_content(s: requests.Session, cid: str, token: str, salt: str, password: 
             r.raise_for_status()
             j = r.json()
             if j.get("status") != "ok":
-                raise RuntimeError(f"GoFile API 返回错误: {j}")
+                raise RuntimeError(f"GoFile API error: {j}")
             return j["data"]
         except Exception as e:
             last = e
@@ -156,7 +156,7 @@ class GoFastV5:
         if len(files) > 1:
             print("\n发现多个文件：")
             for i, f in enumerate(files, 1):
-                print(f"  [{i}] {f.get('name', '未知文件')}  {int(f.get('size', 0))/1024**3:.2f} GiB")
+                print(f"  [{i}] {f.get('name','unknown')}  {int(f.get('size',0))/1024**3:.2f} GiB")
             while True:
                 try:
                     n = int(input("请选择文件编号: "))
@@ -214,12 +214,12 @@ class GoFastV5:
                         f.result()
                 speed = n * probe / max(time.monotonic() - t0, 0.001)
                 results.append((speed, n))
-                print(f"  并发 {n:2d} -> {speed/1024**2:7.1f} MiB/s")
+                print(f"  {n:2d} workers -> {speed/1024**2:7.1f} MiB/s")
             except Exception as e:
-                print(f"  并发 {n:2d} -> 失败（{e}）")
+                print(f"  {n:2d} workers -> FAIL ({e})")
                 results.append((0.0, n))
         speed, best = max(results)
-        print(f"选择并发 {best}（{speed/1024**2:.1f} MiB/s）")
+        print(f"选择 {best} workers ({speed/1024**2:.1f} MiB/s)")
         return best
 
     def _probe(self, url: str, start: int, end: int) -> None:
@@ -271,7 +271,9 @@ class GoFastV5:
         os.replace(tmp, d / "manifest.json")
 
     def create_partial(self, path: Path, total: int):
-        # 兼容之前迁移或下载留下的临时文件，保留已有字节并拒绝状态错配。
+        # Safe recovery for a partial created by a previous migration/download.
+        # If it is shorter than the target, extend it in-place; existing bytes are preserved.
+        # If it is larger than the target, refuse because that indicates a state mismatch.
         if path.exists():
             size = path.stat().st_size
             if size > total:
@@ -340,7 +342,7 @@ class GoFastV5:
             self.save_manifest(state, target, total, workers, segs)
             raise RuntimeError("部分 Range 尚未完成，现场已保存。")
 
-        # 不再合并分片，直接将完整的临时文件改为最终文件。
+        # Finalize without merging: rename the single completed partial file.
         if target.exists():
             backup = target.with_suffix(target.suffix + ".old")
             if backup.exists():
@@ -385,7 +387,7 @@ class GoFastV5:
                                     seg.done = min(seg.done + len(chunk), seg.total)
 
                 if seg.done != seg.total:
-                    raise RuntimeError(f"分片未完成: {seg.done}/{seg.total}")
+                    raise RuntimeError(f"segment incomplete {seg.done}/{seg.total}")
 
                 with self.lock:
                     seg.status = "DONE"
@@ -423,11 +425,11 @@ class GoFastV5:
             "\033[2J\033[H"
             f"{target.name}\n"
             f"[{bar}] {pct:6.2f}%\n"
-            f"已下载      {done/1024**3:8.2f} / {total/1024**3:.2f} GiB\n"
-            f"当前速度    {speed/1024**2:8.1f} MiB/s    平均 {avg/1024**2:8.1f} MiB/s\n"
-            f"预计剩余    {eta_s}               并发 {workers}   活跃 {active}\n"
-            f"分片状态    完成 {sum(s.status=='DONE' for s in segs):4d}/{count:<4d} "
-            f"重试 {retry:3d}  失败 {fail:3d}\n"
+            f"Downloaded  {done/1024**3:8.2f} / {total/1024**3:.2f} GiB\n"
+            f"Speed       {speed/1024**2:8.1f} MiB/s    Average {avg/1024**2:8.1f} MiB/s\n"
+            f"ETA         {eta_s}               Workers {workers}   Active {active}\n"
+            f"Segments    DONE {sum(s.status=='DONE' for s in segs):4d}/{count:<4d} "
+            f"RETRY {retry:3d}  FAIL {fail:3d}\n"
         )
         sys.stdout.flush()
 
@@ -467,14 +469,14 @@ def windows_process_running(name_patterns: list[str]) -> bool:
 
 def migrate_v2(v2_dir: Path, v5_dir: Path, force_name: Optional[str] = None):
     """
-    安全迁移：
-    - 检测到已知 GoFast v1/v2 进程时拒绝迁移；
-    - 读取 v2 清单；
-    - 创建一个预分配的 v5 临时文件；
-    - 将已有 .part 文件复制到对应偏移；
-    - 检查复制期间分片是否发生变化；
-    - 写入可继续下载的 v5 清单。
-    原 v2 目录不会被修改或删除。
+    Safe handoff:
+    - refuse if known GoFast v2/v1 processes appear to be running;
+    - read v2 manifest;
+    - create one v5 preallocated partial;
+    - copy each existing .part into the correct offset;
+    - verify each copied part did not change during copy;
+    - write v5 manifest for continuation.
+    The original v2 directory is NEVER modified or deleted.
     """
     if windows_process_running(["GoFast-GoFile.exe", "gofast.exe", "GoFast.exe"]):
         raise RuntimeError(
@@ -493,17 +495,18 @@ def migrate_v2(v2_dir: Path, v5_dir: Path, force_name: Optional[str] = None):
     total = int(data["total"])
     target = Path(data["target"]).expanduser().resolve()
     name = force_name or target.name
-    # 默认 v5 状态目录放在 v2 目标文件旁，并使用 v5 专用目录名。
+    # Default v5 state lives next to the v2 target, but uses a v5-specific directory.
     v5_target = target.parent / name
     v5_state = (v5_dir.expanduser().resolve() if v5_dir else (v5_target.parent / f".gofast_v5_{v5_target.name}"))
     v5_state.mkdir(parents=True, exist_ok=True)
     partial = v5_state / f"{v5_target.name}.partial"
 
-    # 只创建一个 v5 临时文件；已有迁移留下的短文件只扩展，不删除已复制字节。
+    # Create exactly one v5 partial file. If a previous migration left a short file,
+    # extend it rather than destroying already-copied bytes.
     if partial.exists():
         current = partial.stat().st_size
         if current > total:
-            raise RuntimeError(f"现有 v5 临时文件大于目标大小: {current} > {total}")
+            raise RuntimeError(f"existing v5 partial is larger than target: {current} > {total}")
         if current < total:
             with open(partial, "r+b") as f:
                 f.truncate(total)
@@ -542,7 +545,7 @@ def migrate_v2(v2_dir: Path, v5_dir: Path, force_name: Optional[str] = None):
         seg.status = "DONE" if seg.done == seg.total else "WAIT"
         segs.append(seg)
 
-    # 旧清单没有可用分片信息时，无法安全推断偏移，因此直接停止。
+    # If old manifest didn't include segments, rebuild based on v2 part files.
     if not segs:
         raise RuntimeError("v2 manifest 没有可迁移的 segments")
 
@@ -557,7 +560,7 @@ def migrate_v2(v2_dir: Path, v5_dir: Path, force_name: Optional[str] = None):
         "segments": [asdict(x) for x in segs],
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print("\nV2 → V5 迁移已完成。")
+    print("\nV2 → V5 handoff 已完成。")
     print(f"V2 原目录（未修改）: {v2_dir}")
     print(f"V5 工作目录:        {v5_state}")
     print(f"V5 partial 文件:    {partial}")
@@ -583,11 +586,11 @@ def repair_v5(v5_dir: Path):
     if current < total:
         with open(partial, "r+b") as f:
             f.truncate(total)
-    print("V5 临时文件修复已完成。")
-    print(f"V5 状态目录: {v5_dir}")
-    print(f"临时文件:     {partial}")
-    print(f"当前大小:     {partial.stat().st_size} bytes")
-    print(f"目标大小:     {total} bytes")
+    print("V5 partial repair completed.")
+    print(f"V5 state:  {v5_dir}")
+    print(f"Partial:   {partial}")
+    print(f"Size:      {partial.stat().st_size} bytes")
+    print(f"Expected:  {total} bytes")
     print("现有数据未删除，只将文件扩展到目标大小。")
 
 
@@ -596,10 +599,10 @@ def cmd_migrate(args):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="GoFast-GoFile v5 下载工具")
+    ap = argparse.ArgumentParser(description="GoFast-GoFile v5")
     sub = ap.add_subparsers(dest="command")
 
-    dl = sub.add_parser("download", help="开始或继续下载")
+    dl = sub.add_parser("download", help="start/resume a download")
     dl.add_argument("url")
     dl.add_argument("--out", default="downloads")
     dl.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
@@ -608,13 +611,13 @@ def main() -> int:
     dl.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     dl.add_argument("--password", default=None)
 
-    mig = sub.add_parser("migrate-v2", help="将 v1/v2 分片和清单导入 v5 状态")
-    mig.add_argument("--v2-dir", required=True, help="包含 manifest.json 和 *.part 的 v2 目录")
-    mig.add_argument("--v5-dir", default=None, help="可选的 v5 状态目录")
-    mig.add_argument("--name", default=None, help="可选的最终文件名")
+    mig = sub.add_parser("migrate-v2", help="import v1/v2 .part + manifest into a v5 workspace")
+    mig.add_argument("--v2-dir", required=True, help="v2 directory containing manifest.json and *.part")
+    mig.add_argument("--v5-dir", default=None, help="optional v5 workspace directory")
+    mig.add_argument("--name", default=None, help="optional final filename override")
 
-    rep = sub.add_parser("repair-v5", help="将过短的 v5 临时文件扩展到目标大小，不删除已有字节")
-    rep.add_argument("--v5-dir", required=True, help="包含 manifest.json 和 *.partial 的 v5 目录")
+    rep = sub.add_parser("repair-v5", help="extend a short v5 partial file to the expected size; never deletes existing bytes")
+    rep.add_argument("--v5-dir", required=True, help="v5 directory containing manifest.json and *.partial")
 
     args = ap.parse_args()
 
